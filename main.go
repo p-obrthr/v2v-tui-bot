@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type WebSocketClient struct {
 var (
 	audioBuffer []int16
 	bufferMutex sync.Mutex
+	isRecording int32 = 1
 )
 
 func NewWebSocketClient() (*WebSocketClient, error) {
@@ -66,7 +68,7 @@ func (c *WebSocketClient) ReceiveMessages(ctx context.Context) {
 				switch response["type"] {
 				case "response.audio.delta":
 					if base64Chunk, ok := response["delta"].(string); ok {
-						//	 fmt.Println("receiving audio in base64:", base64Chunk[:10], "...")
+						// fmt.Println("receiving audio in base64:", base64Chunk[:10], "...")
 						ProcessAudioChunk(base64Chunk)
 					}
 				case "response.audio_transcript.delta":
@@ -106,6 +108,34 @@ func (c *WebSocketClient) SendAudio(base64Audio string) error {
 	if err := c.SendMessage(responseMessage); err != nil {
 		return err
 	}
+
+	return nil
+}
+
+func (c *WebSocketClient) SendAudioChunk(base64Audio string) error {
+	audioMessage := map[string]interface{}{
+		"type":  "input_audio_buffer.append",
+		"audio": base64Audio,
+	}
+	if err := c.SendMessage(audioMessage); err != nil {
+		return err
+	}
+
+	// fmt.Println("sended audio chunk len:", len(base64Audio))
+
+	return nil
+}
+
+func (c *WebSocketClient) SendAudioCommit() error {
+	audioMessage := map[string]interface{}{
+		"type": "input_audio_buffer.commit",
+	}
+	if err := c.SendMessage(audioMessage); err != nil {
+		return err
+	}
+
+	// end of input buffer
+	// fmt.Println("sended audio commit")
 
 	return nil
 }
@@ -181,6 +211,65 @@ func PlayAudio() {
 	}
 }
 
+func RecordAudioAndSend(client *WebSocketClient) {
+	portaudio.Initialize()
+	defer portaudio.Terminate()
+
+	inputChannel := 1
+	outputChannel := 0
+	sampleRate := float64(24000)
+	bufferSize := 1024
+	var audioBuffer []int16
+	var bufferMutex sync.Mutex
+
+	stream, err := portaudio.OpenDefaultStream(
+		inputChannel,
+		outputChannel,
+		sampleRate,
+		bufferSize,
+		func(in []int16) {
+			if atomic.LoadInt32(&isRecording) == 1 {
+				bufferMutex.Lock()
+				audioBuffer = append(audioBuffer, in...)
+				bufferMutex.Unlock()
+			}
+		},
+	)
+
+	if err != nil {
+		log.Println("err while opening stream:", err)
+	}
+	defer stream.Close()
+
+	err = stream.Start()
+	if err != nil {
+		log.Println("err while starting stream:", err)
+	}
+	defer stream.Stop()
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for atomic.LoadInt32(&isRecording) == 1 {
+		<-ticker.C
+		bufferMutex.Lock()
+		if len(audioBuffer) > 0 {
+			audioBytes := make([]byte, len(audioBuffer)*2)
+			for i, sample := range audioBuffer {
+				audioBytes[i*2] = byte(sample & 0xFF)
+				audioBytes[i*2+1] = byte((sample >> 8) & 0xFF)
+			}
+			base64Audio := base64.StdEncoding.EncodeToString(audioBytes)
+
+			client.SendAudioChunk(base64Audio)
+			audioBuffer = nil
+		}
+		bufferMutex.Unlock()
+	}
+
+	client.SendAudioCommit()
+}
+
 func (c *WebSocketClient) SendMessage(message interface{}) error {
 	jsonData, err := json.Marshal(message)
 	if err != nil {
@@ -202,19 +291,21 @@ func main() {
 	go client.ReceiveMessages(ctx)
 	go PlayAudio()
 
-	// example input audio file in pcm16, 24000 sample rate & mono
-	audioData, err := os.ReadFile("question.wav")
-	if err != nil {
-		log.Println("err while loading audio file:", err)
-		return
-	}
-	base64Audio := base64.StdEncoding.EncodeToString(audioData)
+	go RecordAudioAndSend(client)
 
-	err = client.SendAudio(base64Audio)
-	if err != nil {
-		log.Println("err while sending audio:", err)
-		return
-	}
+	fmt.Println("Recording started --- Press 'e' and Enter to stop...")
+
+	go func() {
+		var input string
+		for {
+			fmt.Scanln(&input)
+			if input != "e" {
+				return
+			}
+			atomic.StoreInt32(&isRecording, 0)
+			fmt.Println("recording stopped")
+		}
+	}()
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
